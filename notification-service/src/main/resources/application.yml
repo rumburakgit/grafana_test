@@ -1,0 +1,28 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: notification-service
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    prometheus:
+      enabled: true
+    health:
+      show-details: always
+
+notification:
+  queue:
+    max-size: 100
+  batch:
+    size: 10
+    interval-ms: 5000
+
+logging:
+  level:
+    com.demo: INFO

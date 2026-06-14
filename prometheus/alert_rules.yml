@@ -1,0 +1,57 @@
+groups:
+  - name: order-processing-alerts
+    interval: 15s
+    rules:
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{status=~"5.."}[2m])) by (job)
+            /
+            sum(rate(http_server_requests_seconds_count[2m])) by (job)
+          ) > 0.10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP 5xx error rate on {{ $labels.job }}"
+          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 10%) for job {{ $labels.job }}"
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(orders_processing_duration_seconds_bucket[5m])) by (le)
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P95 latency on order-service"
+          description: "P95 latency is {{ $value | humanizeDuration }} (threshold: 500ms)"
+
+      - alert: LowInventory
+        expr: inventory_stock_level < 10
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Inventory stock critically low"
+          description: "Stock level is {{ $value }} (threshold: 10)"
+
+      - alert: NotificationQueueHigh
+        expr: notifications_queue_depth > 80
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Notification queue depth is high"
+          description: "Queue depth is {{ $value }} (threshold: 80)"
+
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "Prometheus cannot scrape {{ $labels.job }} at {{ $labels.instance }}"

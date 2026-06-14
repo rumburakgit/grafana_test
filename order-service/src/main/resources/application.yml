@@ -1,0 +1,31 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: order-service
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    prometheus:
+      enabled: true
+    health:
+      show-details: always
+  metrics:
+    distribution:
+      percentiles-histogram:
+        orders.processing.duration: true
+      percentiles:
+        orders.processing.duration: 0.5,0.95,0.99
+
+services:
+  inventory-url: http://inventory-service:8081
+  notification-url: http://notification-service:8082
+
+logging:
+  level:
+    com.demo: INFO

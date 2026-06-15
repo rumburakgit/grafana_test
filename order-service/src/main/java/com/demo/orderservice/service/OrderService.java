@@ -8,6 +8,7 @@ import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClientException;
@@ -35,10 +36,10 @@ public class OrderService {
     @Value("${services.notification-url}")
     private String notificationUrl;
 
-    public OrderService(MeterRegistry registry, Timer orderProcessingTimer) {
+    public OrderService(MeterRegistry registry, Timer orderProcessingTimer, RestTemplateBuilder restTemplateBuilder) {
         this.registry = registry;
         this.processingTimer = orderProcessingTimer;
-        this.restTemplate = new RestTemplate();
+        this.restTemplate = restTemplateBuilder.build();
 
         Gauge.builder("orders.pending.count", pendingCount, AtomicInteger::get)
                 .description("Number of orders currently pending processing")

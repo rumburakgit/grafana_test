@@ -5,6 +5,134 @@ automatyczny load generator, Prometheus + Grafana + Alertmanager.
 
 ---
 
+## 0. Jak działają serwisy i dlaczego co pewien czas "trwają długo"
+
+Cały system symuluje typowy, niedoskonały sklep internetowy: zamówienie przechodzi przez
+3 serwisy, z których każdy ma wbudowaną **sztuczną losowość** — zmienne opóźnienia, losowe
+błędy i zmieniający się stan magazynu. Dzięki temu metryki w Grafanie wyglądają jak
+"żywy" produkcyjny system, a nie płaska linia.
+
+### order-service (:8080) — orkiestrator
+
+Odbiera `POST /orders {productType, quantity}` i dla każdego zamówienia:
+
+1. Startuje stoper (`orders_processing_duration_seconds`).
+2. Woła **inventory-service** (`POST /inventory/check`), żeby sprawdzić dostępność produktu.
+3. Jeśli magazyn ma towar (`available=true`) → woła **notification-service**
+   (`POST /notifications/send`), a zamówienie dostaje status **COMPLETED**.
+4. Jeśli magazynu nie ma (`available=false`) → zamówienie dostaje status **REJECTED**
+   (powiadomienie nie jest wysyłane).
+5. Zwiększa licznik `orders_created_total{status, product_type}` i zapisuje czas trwania
+   całej operacji w `orders_processing_duration_seconds`.
+
+**"Fail-open" — najważniejsza sztuczka:** jeśli inventory-service nie odpowie (timeout,
+błąd 5xx, połączenie odrzucone), order-service **nie wywala zamówienia**. Loguje ostrzeżenie
+`"Inventory service unreachable, assuming available"` i traktuje produkt jako dostępny,
+więc zamówienie i tak kończy się jako COMPLETED. To pokazuje typowy realny kompromis:
+"lepiej dowieźć zamówienie niż wywalić cały checkout, bo padł jeden zależny serwis" —
+ale też uczy, że takie podejście maskuje błędy w metrykach (error rate inventory-service
+rośnie, a order-service "tego nie widać").
+
+Dodatkowo w tle co 3 sekundy aktualizowany jest gauge `orders_pending_count` losową
+wartością 0-50 — to czysto kosmetyczna symulacja "głębokości kolejki zamówień", niezwiązana
+z realnym przetwarzaniem.
+
+### inventory-service (:8081) — magazyn z losowym opóźnieniem i błędami
+
+Dla każdego `POST /inventory/check`:
+
+- **Losowe opóźnienie 10-800ms** (`Thread.sleep`) przed odpowiedzią — symuluje zmienny
+  czas odpytania bazy danych / magazynu. To jest **główny powód, dla którego część
+  requestów "trwa długo"** — rozkład czasu odpowiedzi jest szeroki, więc P50 vs P95/P99
+  w Grafanie wyraźnie się różnią.
+- **~15% requestów kończy się sztucznym błędem 500** (`RuntimeException("Inventory
+  service internal error (simulated)")`) — symulacja niestabilnego serwisu. Te requesty
+  zliczane są w `inventory_checks_total{result="error"}`. Jak opisano wyżej, order-service
+  i tak "ratuje" takie zamówienie (fail-open).
+- W pozostałych przypadkach porównuje `quantity` z aktualnym `stock` i zwraca
+  `available = stock > quantity`, zliczając `inventory_checks_total{result="available"|"unavailable"}`.
+- Każdy request (sukces i błąd) zapisuje realny czas trwania w
+  `inventory_response_time` (histogram z SLO 0.05/0.1/0.25/0.5/1.0s).
+
+W tle, **co 5 sekund**, osobny wątek aktualizuje stan magazynu (`inventory_stock_level`,
+start = 75, zakres 0-100): z 20% szansą magazyn jest "dostawiany" (+0..29), w pozostałych
+przypadkach jest "drenowany" (-0..4). Dzięki temu stock level powoli oscyluje, a czasem
+spada na tyle nisko, że zamówienia o większej ilości zaczynają dostawać `unavailable`
+i kończą się jako REJECTED — bez żadnej zmiany w kodzie, tylko przez naturalny dryf stanu.
+
+### notification-service (:8082) — asynchroniczna kolejka powiadomień
+
+`POST /notifications/send` **nie wysyła powiadomienia od razu** — tylko wkłada je do
+kolejki w pamięci (max 100 elementów) i odpowiada natychmiast:
+
+- kolejka ma miejsce → `202 {"status":"queued"}`, gauge `notifications_queue_depth` rośnie,
+- kolejka pełna → `503 {"status":"rejected","reason":"queue full"}` i licznik
+  `notifications_failed_total` rośnie (order-service loguje to jako warning, ale **nie**
+  zmienia statusu zamówienia — wciąż COMPLETED).
+
+Niezależnie od tego, **co 5 sekund** (`notification.batch.interval-ms`, domyślnie 5000ms)
+działa wsadowy processor, który pobiera do 10 elementów z kolejki i dla każdego:
+
+- symuluje przetwarzanie z opóźnieniem **50-250ms** (`Thread.sleep`),
+- z ~5% szansą oznacza je jako nieudane (`notifications_failed_total++`), w pozostałych
+  przypadkach jako wysłane (`notifications_sent_total++`),
+- czas całego batcha zapisuje w `notifications_batch_processing_duration_seconds`.
+
+Czyli "wysyłka maila" widoczna w aplikacji jest natychmiastowa (202/503), ale realne
+przetworzenie zachodzi do 5 sekund później, w tle, z własnym (niezależnym) wskaźnikiem
+błędów.
+
+### load-generator — kto generuje ruch
+
+Co 1-3 sekundy wysyła `POST /orders` do order-service w trzech wariantach:
+
+- **70% "normal"** — losowy `productType` (electronics/clothing/food), `quantity` 1-10,
+- **15% "error"** — `productType="invalid_type"`, `quantity=1` (inventory-service nie
+  waliduje typu produktu, więc to trafia do metryk z tagiem `product_type="invalid_type"`,
+  ale samo zamówienie nie jest "błędne" technicznie),
+- **15% "edge"** — losowy `productType`, `quantity=999` — to zawsze przekracza stock
+  (max 100), więc takie zamówienie praktycznie zawsze kończy się jako **REJECTED**
+  (`available=false`).
+
+### Przykładowy przebieg jednego zamówienia (krok po kroku)
+
+Załóżmy `POST /orders {"productType": "electronics", "quantity": 2}`:
+
+1. **order-service** przyjmuje request, startuje timer `orders_processing_duration_seconds`
+   i otwiera root span tracingu (`POST /orders`).
+2. order-service woła `POST http://inventory-service:8081/inventory/check
+   {"productType":"electronics","quantity":2}` — powstaje child span tej rozmowy.
+3. **inventory-service** śpi losowo 10-800ms (np. 430ms), po czym z 85% szansą liczy
+   `available = stock > 2` (np. stock=63 → `available=true`). Zapisuje
+   `inventory_response_time≈0.43s` i zwiększa `inventory_checks_total{result="available"}`.
+   *(Jeśli trafi się 15% scenariusz błędu: inventory-service zwraca 500, span jest
+   oznaczony `error=true`, a order-service łapie wyjątek, loguje "assuming available"
+   i kontynuuje, jakby `available=true`.)*
+4. Skoro `available=true`, order-service woła
+   `POST http://notification-service:8082/notifications/send {"orderId": ...}` —
+   kolejny child span.
+5. **notification-service** sprawdza miejsce w kolejce (max 100), wkłada wiadomość,
+   `notifications_queue_depth` +1, odpowiada `202 {"status":"queued"}` od razu
+   (bez sztucznego opóźnienia na tym etapie).
+6. order-service ustawia zamówieniu status **COMPLETED**, zwiększa
+   `orders_created_total{status="success", product_type="electronics"}`, zamyka timer
+   `orders_processing_duration_seconds` (łączny czas ≈ czas inventory-check + drobny
+   narzut sieciowy + wywołanie notification) i odpowiada wołającemu JSON-em zamówienia.
+   Trace z 3 spanami (order → inventory, order → notification) jest kompletny i widoczny
+   w Tempo/Jaeger.
+7. **Do 5 sekund później**, niezależnie od kroku 6, notification-service w swoim
+   wsadowym processorze odbiera wcześniej zakolejkowaną wiadomość, śpi 50-250ms i z 95%
+   szansą oznacza ją jako wysłaną (`notifications_sent_total++`), aktualizując
+   `notifications_batch_processing_duration_seconds` i zmniejszając
+   `notifications_queue_depth`. Ten krok **nie wpływa** już na status zamówienia
+   zwrócony w kroku 6 — jest całkowicie odseparowany.
+
+Gdyby w kroku 3 magazyn miał `stock <= 2` (np. po kilku cyklach "drenowania" co 5s, albo
+przy `quantity=999` z load-generatora), zamówienie zatrzymałoby się na statusie
+**REJECTED** już po kroku 3 — bez wywołania notification-service.
+
+---
+
 ## 1. Quick Start — Docker Compose
 
 ```bash
@@ -32,6 +160,7 @@ open http://localhost:3000   # login: admin / admin123
 | Grafana         | http://localhost:3000 (admin/admin123)|
 | Prometheus      | http://localhost:9090                 |
 | Alertmanager    | http://localhost:9093                 |
+| Jaeger UI       | http://localhost:16686                |
 | order-service   | http://localhost:8080/orders/stats    |
 | inventory-service | http://localhost:8081/actuator/health |
 | notification-service | http://localhost:8082/notifications/status |
@@ -66,6 +195,57 @@ histogram_quantile(0.95, rate(orders_processing_duration_seconds_bucket[5m]))
 sum(rate(http_server_requests_seconds_count{status=~"5.."}[2m])) by (job)
 / sum(rate(http_server_requests_seconds_count[2m])) by (job)
 ```
+
+---
+
+## Distributed Tracing
+
+Aplikacje są zinstrumentowane przy użyciu Micrometer Tracing + OpenTelemetry
+(auto-konfiguracja — bez zmian w kodzie biznesowym, poza drobną poprawką
+wstrzykiwania `RestTemplate` przez `RestTemplateBuilder`, wymaganą żeby
+auto-instrumentacja w ogóle mogła podłączyć się pod wywołania HTTP).
+
+Trace'y są wysyłane przez OTLP (gRPC) do **Tempo**, które integruje się
+z Grafaną (Service Map, Explore, exemplary). Kontener **Jaeger** też działa
+(port 16686) — ale od Fazy 2 nie odbiera nowych trace'ów (apki eksportują
+do Tempo, nie do Jaegera). Jeśli chcesz wrócić do samego Jaegera, zmień
+`otel.exporter.otlp.endpoint` z `http://tempo:4317` na `http://jaeger:4317`
+w `application.yml` każdego serwisu.
+
+### Jak przeglądać trace'y (Grafana + Tempo)
+
+1. Wyślij kilka requestów:
+   ```bash
+   curl -X POST http://localhost:8080/orders \
+     -H "Content-Type: application/json" \
+     -d '{"productType":"electronics","quantity":1}'
+   ```
+2. Wejdź na http://localhost:3000, otwórz dashboard **"Traces Overview"**
+   (folder "Order Processing Simulator")
+3. Panel **"Service Map"** pokazuje graf połączeń:
+   order-service → inventory-service / notification-service
+4. Panel **"Request Duration P95"** ma włączone exemplary — kliknij punkt
+   na wykresie i wybierz "Query with Tempo", aby przejść do konkretnego
+   trace'u
+5. Alternatywnie: Grafana → Explore → datasource **Tempo** → wyszukaj po
+   `service.name`
+
+### Co obserwować
+
+- Korzeniowy span `http post /orders` w order-service — całkowity czas requestu
+- Span wywołania do inventory-service — czas sprawdzenia stanu magazynu
+- Span wywołania do notification-service — czas wysłania powiadomienia
+- Gdy inventory-service zwraca błąd — span jest oznaczony jako `error=true`
+  i zaznaczony na czerwono
+- Porównaj trace szybkiego requestu z wolnym — różnica w czasie zwykle
+  pochodzi ze span'a inventory-service
+
+> **Uwaga:** Tempo (local storage) i Jaeger all-in-one (in-memory)
+> przechowują dane tymczasowo — po `docker compose down -v` trace'y znikają.
+> To normalne dla wersji demo.
+>
+> Sampling jest ustawiony na `1.0` (100% requestów) tylko do nauki —
+> na produkcji użyj wartości `0.01`–`0.1`.
 
 ---
 

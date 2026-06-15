@@ -19,12 +19,34 @@ management:
     distribution:
       percentiles-histogram:
         orders.processing.duration: true
+        http.server.requests: true
       percentiles:
         orders.processing.duration: 0.5,0.95,0.99
+  tracing:
+    sampling:
+      probability: 1.0  # 100% requestów — do nauki, na produkcji 0.1
 
 services:
   inventory-url: http://inventory-service:8081
   notification-url: http://notification-service:8082
+
+otel:
+  exporter:
+    otlp:
+      endpoint: http://tempo:4317
+      protocol: grpc
+  resource:
+    attributes:
+      service.name: order-service
+  logs:
+    exporter: none
+  metrics:
+    exporter: none
+  instrumentation:
+    spring-webmvc:
+      enabled: false
+    spring-web:
+      enabled: false
 
 logging:
   level:

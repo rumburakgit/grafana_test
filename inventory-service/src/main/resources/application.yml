@@ -15,6 +15,31 @@ management:
       enabled: true
     health:
       show-details: always
+  tracing:
+    sampling:
+      probability: 1.0  # 100% requestów — do nauki, na produkcji 0.1
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+
+otel:
+  exporter:
+    otlp:
+      endpoint: http://tempo:4317
+      protocol: grpc
+  resource:
+    attributes:
+      service.name: inventory-service
+  logs:
+    exporter: none
+  metrics:
+    exporter: none
+  instrumentation:
+    spring-webmvc:
+      enabled: false
+    spring-web:
+      enabled: false
 
 logging:
   level:

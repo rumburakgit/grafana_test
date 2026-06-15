@@ -3,6 +3,9 @@ version: '3.9'
 networks:
   monitoring:
     driver: bridge
+  notifications:
+    external: true
+    name: notifications-service_default
 
 volumes:
   prometheus-data:
@@ -137,6 +140,7 @@ services:
       - "9093:9093"
     networks:
       - monitoring
+      - notifications
     volumes:
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     command:

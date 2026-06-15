@@ -36,6 +36,9 @@ open http://localhost:3000   # login: admin / admin123
 | inventory-service | http://localhost:8081/actuator/health |
 | notification-service | http://localhost:8082/notifications/status |
 
+
+
+
 ### Ręczne wywołanie zamówienia
 
 ```bash
@@ -136,7 +139,7 @@ kubectl scale deployment/load-generator -n order-processing --replicas=5
 
 # odpytujemy te adresy
 http://localhost:9090/targets?search=
-http://order-service:8080/actuator/prometheus -> http://localhost:8080/actuator/prometheus
+http://localhost:8080/actuator/prometheus
 
 ### Zadanie 1 — Rate i aggregation
 > Policz ile zamówień na minutę jest tworzonych z podziałem na typ produktu.
